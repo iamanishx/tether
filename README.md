@@ -1,15 +1,16 @@
 # tether
 
 A small, durable control layer for AI agents that run code in sandboxes. Works with
-[E2B](https://e2b.dev) (hosted) and [Perplexity SPACE](https://github.com/perplexityai/SPACE) (self-hosted).
+[E2B Cloud](https://e2b.dev), self-hosted [E2B Embed](https://github.com/e2b-dev/infra/tree/main/embed)
+and self-hosted [Perplexity SPACE](https://github.com/perplexityai/SPACE).
 
 The sandbox gives you isolation. Your agent (Pi, or anything that can call HTTP) gives you reasoning.
 **tether sits between them and makes the *actions* durable**: what was requested, what ran, and what
 is still unknown after a crash.
 
 ```
-agent (Pi, etc.) ──HTTP──▶ tetherd ──┬──▶ E2B sandbox      (-backend e2b)
-                             │       └──▶ SPACE microVM    (-backend space)
+agent (Pi, etc.) ──HTTP──▶ tetherd ──┬──▶ E2B Cloud or E2B Embed   (-backend e2b)
+                             │       └──▶ SPACE microVM            (-backend space)
                              └── durable task + action ledger on disk
 ```
 
@@ -42,6 +43,22 @@ make build
 ./bin/tetherd -backend e2b -data-dir ./data
 ```
 
+**E2B Embed** (self-hosted, same `-backend e2b`; the whole E2B stack on one Linux host with KVM, via
+Docker Compose, or Terraform for GCP / AWS / Azure, or one Kubernetes node — see the
+[Embed guide](https://github.com/e2b-dev/infra/blob/main/embed/README.md)). After `docker compose up`,
+Embed prints the SDK variables; tether reads the same names:
+
+```bash
+eval "$(docker compose exec ready cat /run/e2b/sdk.env)"   # sets E2B_API_KEY, E2B_API_URL, E2B_SANDBOX_URL, ...
+export TETHER_API_TOKEN=$(openssl rand -hex 24)
+./bin/tetherd -backend e2b -template base -data-dir ./data
+```
+
+`E2B_API_URL` is the REST API (port 3000) and `E2B_SANDBOX_URL` the client-proxy (port 3002), which
+routes to a sandbox by `E2b-Sandbox-Id` / `E2b-Sandbox-Port` headers. Leave both unset for E2B Cloud.
+Use a template that includes the code-interpreter server (Cloud: `code-interpreter-v1`; on Embed build
+one from `e2bdev/code-interpreter` or run `bash`/`python` via a plain template as you prefer).
+
 **SPACE** (self-hosted Firecracker microVMs; needs a running [SPACE deployment](https://github.com/perplexityai/SPACE/blob/main/docs/installation.md)):
 
 ```bash
@@ -55,15 +72,16 @@ make build
 
 ### Backend differences
 
-| | `e2b` | `space` |
-| :-- | :-- | :-- |
-| Where it runs | E2B cloud | Your Kubernetes / KVM hosts |
-| Execution | Jupyter-style code interpreter (stateful kernel, rich results) | One process per action (`python3 -c`, `sh -c`, `node -e`); no kernel state between actions |
-| Languages | python, bash, javascript, r, java | python, bash, javascript |
-| Idle handling | Auto-pause after `-sandbox-ttl`, resumed on next action | SPACE's own idle policy (default: suspend after 6 h); tether wakes it on next action |
-| Lifecycle calls | Synchronous | Async operations, polled by tether |
-| Output | NDJSON stream from the sandbox | SSE from the data plane with a per-command attachment token |
-| Non-zero exit | n/a (exceptions are reported) | Recorded as `exit_code` + an `ExitError` on the action (a *failed* action, not an unknown one) |
+| | `e2b` (Cloud) | `e2b` (Embed, self-hosted) | `space` |
+| :-- | :-- | :-- | :-- |
+| Where it runs | E2B cloud | One Linux host with KVM you own (Compose / Terraform GCP, AWS, Azure / one K8s node) | Your Kubernetes / KVM hosts |
+| Ops burden | None | Low: one node, no license, Apache-2.0; multi-node needs E2B BYOC/enterprise | High: control plane, btrfs nodes, warm pools, object storage |
+| Execution | Jupyter-style code interpreter (stateful kernel, rich results) | Jupyter-style code interpreter (stateful kernel, rich results) | One process per action (`python3 -c`, `sh -c`, `node -e`); no kernel state between actions |
+| Languages | python, bash, javascript, r, java | python, bash, javascript, r, java | python, bash, javascript |
+| Idle handling | Auto-pause after `-sandbox-ttl`, resumed on next action | Auto-pause after `-sandbox-ttl`, resumed on next action | SPACE's own idle policy (default: suspend after 6 h); tether wakes it on next action |
+| Lifecycle calls | Synchronous | Synchronous | Async operations, polled by tether |
+| Output | NDJSON stream from the sandbox | NDJSON stream from the sandbox | SSE from the data plane with a per-command attachment token |
+| Non-zero exit | n/a (exceptions are reported) | n/a (exceptions are reported) | Recorded as `exit_code` + an `ExitError` on the action (a *failed* action, not an unknown one) |
 
 On SPACE, every mutation carries a fresh `Idempotency-Key`, and the attachment token is only ever sent to
 `SPACE_DATA_PLANE_URL`, never to a host the API response points at.
@@ -106,6 +124,8 @@ Language defaults to Python; pass `"language": "bash"` or `"javascript"` for oth
 
 ## Operating notes
 
+- **Self-hosted E2B Embed:** its REST API (3000) and client-proxy (3002) authenticate only by the team API
+  key; firewall them to tether's host, and never expose the orchestrator's unauthenticated gRPC port (5008).
 - **One owning process per data dir** (enforced with `flock`). Back up `data/` or put it on a replicated volume;
   tether fsyncs every write, but a lost disk is a lost ledger.
 - Keep **artifacts you care about outside the sandbox**. `complete`/`cancel` kill the sandbox.

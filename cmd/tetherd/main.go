@@ -94,7 +94,13 @@ func newBackend(name, template string) (sandbox.Sandbox, error) {
 		if template == "" {
 			template = "code-interpreter-v1"
 		}
-		return sandbox.NewE2B(key, template), nil
+		// Unset = E2B Cloud. For self-hosted Embed/BYOC, point these at the
+		// install's api (:3000) and client-proxy (:3002); same names as the SDKs.
+		return sandbox.NewE2BWithOptions(key, template, sandbox.E2BOptions{
+			APIURL:     os.Getenv("E2B_API_URL"),
+			SandboxURL: os.Getenv("E2B_SANDBOX_URL"),
+			Domain:     os.Getenv("E2B_DOMAIN"),
+		})
 	case "space":
 		api, data, tok := os.Getenv("SPACE_API_URL"), os.Getenv("SPACE_DATA_PLANE_URL"), os.Getenv("SPACE_API_TOKEN")
 		if api == "" || data == "" || tok == "" {

@@ -20,23 +20,56 @@ const (
 
 // E2B talks to the E2B control plane (sandbox lifecycle) and to the
 // code-interpreter server inside the sandbox (code execution) over plain HTTP.
+// It works against E2B Cloud and against a self-hosted E2B Embed / BYOC
+// deployment: the same REST API and the same header-routed sandbox proxy.
 type E2B struct {
-	apiKey   string
-	apiURL   string
-	domain   string
-	template string
-	http     *http.Client
+	apiKey     string
+	apiURL     string
+	sandboxURL string // if set, every sandbox is reached here via header routing
+	domain     string
+	template   string
+	http       *http.Client
 }
 
-// NewE2B returns an E2B client. template is e.g. "code-interpreter-v1".
+// E2BOptions overrides the cloud defaults for a self-hosted deployment. The
+// names match the official SDKs' E2B_API_URL / E2B_SANDBOX_URL / E2B_DOMAIN.
+type E2BOptions struct {
+	APIURL     string // e.g. http://embed-host:3000
+	SandboxURL string // e.g. http://embed-host:3002 (client-proxy, header routing)
+	Domain     string // used to build per-sandbox hosts when SandboxURL is empty
+}
+
+// NewE2B returns a client for E2B Cloud. template is e.g. "code-interpreter-v1".
 func NewE2B(apiKey, template string) *E2B {
-	return &E2B{
-		apiKey:   apiKey,
-		apiURL:   "https://api." + defaultDomain,
-		domain:   defaultDomain,
-		template: template,
-		http:     &http.Client{Timeout: 0}, // per-call deadlines come from ctx
+	e, _ := NewE2BWithOptions(apiKey, template, E2BOptions{})
+	return e
+}
+
+// NewE2BWithOptions returns a client for E2B Cloud or a self-hosted deployment.
+func NewE2BWithOptions(apiKey, template string, o E2BOptions) (*E2B, error) {
+	domain := o.Domain
+	if domain == "" {
+		domain = defaultDomain
 	}
+	apiURL := o.APIURL
+	if apiURL == "" {
+		apiURL = "https://api." + domain
+	}
+	for _, u := range []string{apiURL, o.SandboxURL} {
+		if u != "" {
+			if err := checkOrigin(u); err != nil {
+				return nil, fmt.Errorf("E2B: %w", err)
+			}
+		}
+	}
+	return &E2B{
+		apiKey:     apiKey,
+		apiURL:     strings.TrimRight(apiURL, "/"),
+		sandboxURL: strings.TrimRight(o.SandboxURL, "/"),
+		domain:     domain,
+		template:   template,
+		http:       &http.Client{Timeout: 0}, // per-call deadlines come from ctx
+	}, nil
 }
 
 type sandboxResp struct {
@@ -132,8 +165,13 @@ func (e *E2B) api(ctx context.Context, method, path string, in, out any) (int, e
 	return resp.StatusCode, nil
 }
 
-// execURL mirrors the E2B SDKs: the stable host on prod, a per-sandbox host elsewhere.
-func execURL(h Handle) string {
+// execURL mirrors the E2B SDKs: an explicit sandbox URL (self-hosted
+// client-proxy, header routing) wins; then the stable host on E2B Cloud; else a
+// per-sandbox host under the domain.
+func (e *E2B) execURL(h Handle) string {
+	if e.sandboxURL != "" {
+		return e.sandboxURL + "/execute"
+	}
 	if h.Domain == defaultDomain {
 		return "https://sandbox." + h.Domain + "/execute"
 	}
@@ -156,7 +194,7 @@ func (e *E2B) Exec(ctx context.Context, h Handle, r ExecRequest) (ExecResult, er
 		payload["language"] = r.Language
 	}
 	b, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, execURL(h), bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.execURL(h), bytes.NewReader(b))
 	if err != nil {
 		return ExecResult{}, err
 	}
