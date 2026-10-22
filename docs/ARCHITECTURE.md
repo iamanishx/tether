@@ -1,6 +1,7 @@
 # Architecture
 
-tether is deliberately small. E2B owns isolation and the sandbox lifecycle; the agent owns reasoning.
+tether is deliberately small. The sandbox provider (E2B or SPACE) owns isolation and the sandbox
+lifecycle; the agent owns reasoning.
 tether owns exactly one thing: **a durable record of what the agent asked the sandbox to do.**
 
 ## Components
@@ -12,10 +13,14 @@ flowchart LR
         API["HTTP API<br/>bearer auth"]
         Engine["Task engine<br/>ledger · approvals · recovery"]
         Store[("Durable store<br/>JSON per task<br/>write-tmp + fsync + rename")]
-        Adapter["E2B adapter"]
+        Adapter["Sandbox interface<br/>Create · Connect · Exec · Pause · Kill"]
+        E2BA["E2B adapter"]
+        SPA["SPACE adapter"]
     end
-    E2B["E2B control plane<br/>api.e2b.app"]
+    E2B["E2B control plane"]
     SBX["E2B sandbox<br/>code-interpreter :49999"]
+    SCP["SPACE control plane<br/>/v1/sandboxes, /v1/operations"]
+    SDP["SPACE data plane<br/>/v1/sessions/{id}/events (SSE)"]
     Human["Human approver"]
 
     Agent -->|"submit action_id"| API
@@ -23,9 +28,11 @@ flowchart LR
     API --> Engine
     Engine <--> Store
     Engine --> Adapter
-    Adapter -->|"create / connect / pause / kill"| E2B
-    Adapter -->|"POST /execute (NDJSON)"| SBX
-    E2B -. manages .- SBX
+    Adapter --> E2BA & SPA
+    E2BA -->|"create / connect / pause / kill"| E2B
+    E2BA -->|"POST /execute (NDJSON)"| SBX
+    SPA -->|"create / wake / suspend / delete<br/>+ Idempotency-Key, poll operation"| SCP
+    SPA -->|"attach with per-command token"| SDP
 ```
 
 ## Action lifecycle
@@ -127,9 +134,18 @@ When you outgrow it: put a workflow engine (e.g. Temporal) in front for durable 
 swap `internal/store` for Postgres behind the same `Save/Load/IDs` surface. Keep tether (or its ledger
 rules) as the layer that owns action dedupe and reconciliation.
 
+## SPACE backend notes
+
+SPACE is asynchronous: create, wake, suspend and delete return an `operation_id` that tether polls until
+`succeeded`, then polls the sandbox until `running`. Commands run as a fresh process per action, so unlike
+E2B's kernel there is no variable state carried between actions; put anything that must persist on the
+sandbox filesystem. The output stream ending without `process_exited` (or reporting `error` /
+`resync_required`) is treated as an unknown outcome, exactly like a lost E2B response, and goes through the
+same `outcome_unknown` reconciliation path.
+
 ## Out of scope (on purpose)
 
-- Running Firecracker yourself (E2B does this).
+- Running Firecracker yourself (E2B or SPACE does this).
 - Per-user OAuth token injection. If sandboxed code needs third-party credentials, pass short-lived scoped
   tokens per task, or add an egress proxy as a separate component.
 - Multi-node HA / active-active.
