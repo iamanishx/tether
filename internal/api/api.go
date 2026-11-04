@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -145,6 +146,10 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return false
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		writeErr(w, http.StatusBadRequest, "request must contain exactly one JSON object")
 		return false
 	}
 	return true

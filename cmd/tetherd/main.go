@@ -21,6 +21,7 @@ import (
 
 func main() {
 	backend := flag.String("backend", "e2b", "sandbox backend: e2b or space")
+	execMode := flag.String("e2b-exec-mode", os.Getenv("E2B_EXEC_MODE"), "E2B executor: interpreter or commands (default: commands for self-hosted, interpreter for Cloud)")
 	listen := flag.String("listen", "127.0.0.1:8090", "HTTP listen address")
 	dataDir := flag.String("data-dir", "./data", "directory for durable task state (one owning process)")
 	template := flag.String("template", "", "sandbox template (default: code-interpreter-v1 for e2b, seed:latest for space)")
@@ -28,10 +29,15 @@ func main() {
 	execTimeout := flag.Duration("exec-timeout", 2*time.Minute, "time budget for a single action")
 	maxAttempts := flag.Int("max-attempts", 3, "max executions per action (persisted across restarts)")
 	maxActions := flag.Int("max-actions", 200, "max actions per task")
+	maxConcurrent := flag.Int("max-concurrent-actions", 0, "global action limit (0: unlimited; use 1 on tiny local hosts)")
+	pauseAfterAction := flag.Bool("pause-after-action", false, "pause the sandbox after each action to free guest RAM while preserving its filesystem")
 	noAuth := flag.Bool("no-auth", false, "disable bearer-token auth (local development only)")
 	flag.Parse()
+	if *maxConcurrent < 0 {
+		log.Fatal("max-concurrent-actions must be non-negative")
+	}
 
-	sb, err := newBackend(*backend, *template)
+	sb, err := newBackend(*backend, *template, *execMode)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -48,6 +54,7 @@ func main() {
 
 	eng := task.NewEngine(st, sb, task.Config{
 		SandboxTTLSec: *ttl, ExecTimeout: *execTimeout, MaxAttempts: *maxAttempts, MaxActions: *maxActions,
+		MaxConcurrentActions: *maxConcurrent, PauseAfterAction: *pauseAfterAction,
 	})
 
 	// Reclassify anything that was in flight when the last process stopped
@@ -84,15 +91,24 @@ func main() {
 }
 
 // newBackend builds the sandbox client for the chosen backend from env vars.
-func newBackend(name, template string) (sandbox.Sandbox, error) {
+func newBackend(name, template, execMode string) (sandbox.Sandbox, error) {
 	switch name {
 	case "e2b":
 		key := os.Getenv("E2B_API_KEY")
 		if key == "" {
 			return nil, errors.New("E2B_API_KEY is required for -backend e2b")
 		}
+		if execMode == "" {
+			execMode = "interpreter"
+			if os.Getenv("E2B_API_URL") != "" || os.Getenv("E2B_SANDBOX_URL") != "" {
+				execMode = "commands"
+			}
+		}
 		if template == "" {
 			template = "code-interpreter-v1"
+			if execMode == "commands" {
+				template = "base"
+			}
 		}
 		// Unset = E2B Cloud. For self-hosted Embed/BYOC, point these at the
 		// install's api (:3000) and client-proxy (:3002); same names as the SDKs.
@@ -100,6 +116,7 @@ func newBackend(name, template string) (sandbox.Sandbox, error) {
 			APIURL:     os.Getenv("E2B_API_URL"),
 			SandboxURL: os.Getenv("E2B_SANDBOX_URL"),
 			Domain:     os.Getenv("E2B_DOMAIN"),
+			ExecMode:   execMode,
 		})
 	case "space":
 		api, data, tok := os.Getenv("SPACE_API_URL"), os.Getenv("SPACE_DATA_PLANE_URL"), os.Getenv("SPACE_API_TOKEN")

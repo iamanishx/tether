@@ -35,11 +35,13 @@ type ExecError struct {
 }
 
 type ExecResult struct {
-	Stdout   string     `json:"stdout"`
-	Stderr   string     `json:"stderr"`
-	Results  []string   `json:"results,omitempty"`
-	ExitCode int        `json:"exit_code,omitempty"`
-	Error    *ExecError `json:"error,omitempty"`
+	Stdout          string     `json:"stdout"`
+	Stderr          string     `json:"stderr"`
+	Results         []string   `json:"results,omitempty"`
+	ExitCode        int        `json:"exit_code,omitempty"`
+	ProcessID       uint32     `json:"process_id,omitempty"` // envd PID, useful when reconciling lost streams
+	OutputTruncated bool       `json:"output_truncated,omitempty"`
+	Error           *ExecError `json:"error,omitempty"`
 }
 
 type Sandbox interface {

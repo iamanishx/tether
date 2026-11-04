@@ -17,10 +17,12 @@ import (
 )
 
 type Config struct {
-	SandboxTTLSec int           // sandbox lifetime before E2B auto-pauses it
-	ExecTimeout   time.Duration // budget for one action, including sandbox (re)connect
-	MaxAttempts   int           // per action, persisted, survives restarts
-	MaxActions    int           // per task
+	SandboxTTLSec        int           // sandbox lifetime before E2B auto-pauses it
+	ExecTimeout          time.Duration // budget for one action, including sandbox (re)connect
+	MaxAttempts          int           // per action, persisted, survives restarts
+	MaxActions           int           // per task
+	MaxConcurrentActions int           // global admission limit; 0 keeps the legacy unlimited mode
+	PauseAfterAction     bool          // local/small hosts: preserve state on disk and release guest RAM
 }
 
 func (c Config) withDefaults() Config {
@@ -47,10 +49,15 @@ type Engine struct {
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
+	slots chan struct{}
 }
 
 func NewEngine(st *store.Store, sb sandbox.Sandbox, cfg Config) *Engine {
-	return &Engine{st: st, sb: sb, cfg: cfg.withDefaults(), now: time.Now, locks: map[string]*sync.Mutex{}}
+	e := &Engine{st: st, sb: sb, cfg: cfg.withDefaults(), now: time.Now, locks: map[string]*sync.Mutex{}}
+	if cfg.MaxConcurrentActions > 0 {
+		e.slots = make(chan struct{}, cfg.MaxConcurrentActions)
+	}
+	return e
 }
 
 // lock serialises all mutations of one task (sandbox state is sequential too).
@@ -153,7 +160,8 @@ func (e *Engine) Submit(ctx context.Context, taskID string, r SubmitReq) (a *Act
 		return nil, false, fmt.Errorf("%w: action_id is required and must match [A-Za-z0-9._-]", ErrBadRequest)
 	}
 	if existing := t.action(r.ActionID); existing != nil {
-		if existing.Code != r.Code || existing.Language != r.Language {
+		if existing.Code != r.Code || existing.Language != r.Language ||
+			existing.Idempotent != r.Idempotent || existing.RequiresApproval != r.RequiresApproval {
 			return nil, false, fmt.Errorf("%w: action_id %s already used with a different request", ErrConflict, r.ActionID)
 		}
 		return existing, true, nil
@@ -326,6 +334,16 @@ func (e *Engine) execute(ctx context.Context, t *Task, a *Action) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.cfg.ExecTimeout)
 	defer cancel()
 
+	if e.slots != nil {
+		select {
+		case e.slots <- struct{}{}:
+			defer func() { <-e.slots }()
+		case <-ctx.Done():
+			a.Status, a.Error = StatusFailed, "capacity wait timed out; no code was dispatched"
+			return e.finish(t, a)
+		}
+	}
+
 	h, err := e.ensureSandbox(ctx, t)
 	if err != nil {
 		// Nothing was sent to the sandbox, so this is a definite, retryable failure.
@@ -333,7 +351,26 @@ func (e *Engine) execute(ctx context.Context, t *Task, a *Action) error {
 		return e.finish(t, a)
 	}
 
+	if e.cfg.PauseAfterAction {
+		defer func() {
+			pauseCtx, stop := context.WithTimeout(context.Background(), 15*time.Second)
+			defer stop()
+			if err := e.sb.Pause(pauseCtx, h.ID); err != nil {
+				t.Events = append(t.Events, Event{At: e.now(), Kind: "sandbox_pause_failed", Detail: "guest state may still consume RAM: " + err.Error()})
+			} else {
+				t.Events = append(t.Events, Event{At: e.now(), Kind: "sandbox_paused", Detail: h.ID})
+			}
+			if err := e.save(t); err != nil {
+				log.Printf("persist pause event for %s: %v", t.ID, err)
+			}
+		}()
+	}
 	res, err := e.sb.Exec(ctx, h, sandbox.ExecRequest{Code: a.Code, Language: a.Language})
+	// Partial output/PID is evidence, not proof of success. Keep it even when
+	// the transport dies so an operator can inspect the original process.
+	if res.ProcessID != 0 || res.Stdout != "" || res.Stderr != "" || res.OutputTruncated {
+		a.Result = &res
+	}
 	switch {
 	case err != nil && a.Idempotent:
 		a.Status, a.Error = StatusFailed, "execution error (action is idempotent, safe to retry): "+err.Error()

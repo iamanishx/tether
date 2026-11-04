@@ -18,7 +18,7 @@ flowchart LR
         SPA["SPACE adapter"]
     end
     E2B["E2B control plane"]
-    SBX["E2B sandbox<br/>code-interpreter :49999"]
+    SBX["E2B sandbox<br/>envd process :49983<br/>or interpreter :49999"]
     SCP["SPACE control plane<br/>/v1/sandboxes, /v1/operations"]
     SDP["SPACE data plane<br/>/v1/sessions/{id}/events (SSE)"]
     Human["Human approver"]
@@ -30,7 +30,7 @@ flowchart LR
     Engine --> Adapter
     Adapter --> E2BA & SPA
     E2BA -->|"create / connect / pause / kill"| E2B
-    E2BA -->|"POST /execute (NDJSON)"| SBX
+    E2BA -->|"commands: Connect Process.Start<br/>interpreter: /execute NDJSON"| SBX
     SPA -->|"create / wake / suspend / delete<br/>+ Idempotency-Key, poll operation"| SCP
     SPA -->|"attach with per-command token"| SDP
 ```
@@ -116,8 +116,14 @@ let tether be the only place that decides whether it runs again.
 
 ## Scaling and deployment
 
-tether is a single-node service by design (one process owns the data dir). That is enough for a first
-production workload: E2B does the heavy, scalable part.
+tether is a single-node service by design (one process owns the data dir). The provider does the heavy
+sandbox work, but that does not make Tether multi-node or production-certified.
+
+The local helper admits one action at a time and requests a pause after each action. This separates
+logical agents/tasks from resident VMs: each task retains its own sandbox ID and filesystem while the
+provider is expected to restore its paused state on the next call. Memory reclamation is asynchronous;
+our live test still hits a reconnect-capacity failure on the 512 MiB pool. No validated agent count or
+complete persistence guarantee has been established yet. See [TESTING.md](TESTING.md).
 
 ```mermaid
 flowchart TB
@@ -131,8 +137,10 @@ flowchart TB
 ```
 
 When you outgrow it: put a workflow engine (e.g. Temporal) in front for durable timers and long waits, and
-swap `internal/store` for Postgres behind the same `Save/Load/IDs` surface. Keep tether (or its ledger
-rules) as the layer that owns action dedupe and reconciliation.
+replace `internal/store` with a transactional database and add cross-worker ownership, unique action
+constraints, admission control and an outbox. Merely swapping `Save/Load/IDs` for PostgreSQL does not
+make the current in-process task locks distributed. Keep tether (or its ledger rules) as the layer
+that owns action dedupe and reconciliation.
 
 ## SPACE backend notes
 

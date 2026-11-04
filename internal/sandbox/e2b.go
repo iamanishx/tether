@@ -28,6 +28,7 @@ type E2B struct {
 	sandboxURL string // if set, every sandbox is reached here via header routing
 	domain     string
 	template   string
+	execMode   string
 	http       *http.Client
 }
 
@@ -37,6 +38,7 @@ type E2BOptions struct {
 	APIURL     string // e.g. http://embed-host:3000
 	SandboxURL string // e.g. http://embed-host:3002 (client-proxy, header routing)
 	Domain     string // used to build per-sandbox hosts when SandboxURL is empty
+	ExecMode   string // "interpreter" (default) or "commands" (plain envd templates)
 }
 
 // NewE2B returns a client for E2B Cloud. template is e.g. "code-interpreter-v1".
@@ -47,6 +49,13 @@ func NewE2B(apiKey, template string) *E2B {
 
 // NewE2BWithOptions returns a client for E2B Cloud or a self-hosted deployment.
 func NewE2BWithOptions(apiKey, template string, o E2BOptions) (*E2B, error) {
+	mode := o.ExecMode
+	if mode == "" {
+		mode = "interpreter"
+	}
+	if mode != "interpreter" && mode != "commands" {
+		return nil, fmt.Errorf("E2B: invalid execution mode %q (use interpreter or commands)", mode)
+	}
 	domain := o.Domain
 	if domain == "" {
 		domain = defaultDomain
@@ -68,6 +77,7 @@ func NewE2BWithOptions(apiKey, template string, o E2BOptions) (*E2B, error) {
 		sandboxURL: strings.TrimRight(o.SandboxURL, "/"),
 		domain:     domain,
 		template:   template,
+		execMode:   mode,
 		http:       &http.Client{Timeout: 0}, // per-call deadlines come from ctx
 	}, nil
 }
@@ -189,6 +199,9 @@ type streamLine struct {
 // Exec runs code with the in-sandbox code-interpreter server and folds its
 // newline-delimited JSON stream into one result.
 func (e *E2B) Exec(ctx context.Context, h Handle, r ExecRequest) (ExecResult, error) {
+	if e.execMode == "commands" {
+		return e.execCommand(ctx, h, r)
+	}
 	payload := map[string]any{"code": r.Code}
 	if r.Language != "" {
 		payload["language"] = r.Language
